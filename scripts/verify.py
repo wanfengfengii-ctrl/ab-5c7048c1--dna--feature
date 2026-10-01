@@ -9,8 +9,11 @@ Runs inside the image (or a local checkout) and performs, in order:
      * a unique solution with degraded (mismatch-carrying) reads and exact
        mismatch evidence,
      * an ambiguous instance returning the first two distinct solutions,
-     * NO_SOLUTION and DISCONTINUOUS_INPUT business errors,
-     * INVALID_INPUT shape validation.
+     * an unlabelled instance proving legacy request/response compatibility,
+     * a molecule-family instance whose atomic groups change the optimum,
+       with per-family group/members/aggregate evidence,
+     * FAMILY_NO_SOLUTION / NO_SOLUTION / DISCONTINUOUS_INPUT business errors,
+     * INVALID_INPUT shape validation (incl. illegal family sizes),
 
 The exit code is a bit-mask summarizing the stages:
 
@@ -43,9 +46,9 @@ FAIL_SMOKE = 2
 # --------------------------------------------------------------------------
 
 
-def make_read(rid, start, end, obs, costs=None, allow=None):
+def make_read(rid, start, end, obs, costs=None, allow=None, molecule_id=None):
     width = end - start
-    return {
+    read = {
         "id": rid,
         "start": start,
         "end": end,
@@ -53,6 +56,9 @@ def make_read(rid, start, end, obs, costs=None, allow=None):
         "mismatch_costs": list(costs) if costs is not None else [1] * width,
         "max_mismatches": width if allow is None else allow,
     }
+    if molecule_id is not None:
+        read["molecule_id"] = molecule_id
+    return read
 
 
 def mismatch_sample():
@@ -76,6 +82,65 @@ def mismatch_sample():
     reads[7]["mismatch_costs"] = [5, 3]
     reads[7]["max_mismatches"] = 1
     return {"n_sites": 8, "reads": reads}
+
+
+def family_sample():
+    """Clean instance whose reads carry molecule families.
+
+    Four same-chromosome pairs are clean; the cross-chromosome pair a4+b4
+    must share a group, forcing positive cost.  Without labels the exact
+    same reads solve at cost 0 with a4 and b4 on opposite groups, so the
+    family constraint changes the optimum (a "solve then repair" pass could
+    not reach this answer).
+    """
+    hap = [0, 1, 1, 0, 1, 0, 0, 1]
+    comp = [1 - b for b in hap]
+    spans0 = [(0, 3), (2, 5), (4, 7), (1, 4), (5, 8)]
+    spans1 = [(0, 2), (3, 6), (6, 8), (2, 4), (4, 8)]
+    reads = []
+    for i, (s, e) in enumerate(spans0):
+        allow = e - s if i == 4 else 0
+        reads.append(make_read(f"a{i}", s, e, hap[s:e], allow=allow))
+    for i, (s, e) in enumerate(spans1):
+        allow = e - s if i == 4 else 0
+        reads.append(make_read(f"b{i}", s, e, comp[s:e], allow=allow))
+    pairs = [("a0", "a1"), ("a2", "a3"), ("b0", "b1"), ("b2", "b3"), ("a4", "b4")]
+    mol_by_id = {rid: f"mol{k}" for k, pair in enumerate(pairs) for rid in pair}
+    for r in reads:
+        r["molecule_id"] = mol_by_id[r["id"]]
+    return {"n_sites": 8, "reads": reads}
+
+
+def unlabel_family_sample():
+    return {
+        "n_sites": 8,
+        "reads": [
+            {k: v for k, v in r.items() if k != "molecule_id"}
+            for r in family_sample()["reads"]
+        ],
+    }
+
+
+def family_no_solution_sample():
+    """A complementary pair in one family is unsatisfiable as a unit."""
+    hap = [0, 0, 1, 1, 0, 1, 0, 1]
+    comp = [1 - b for b in hap]
+    reads = [
+        make_read("f0a", 0, 8, hap, allow=0, molecule_id="f0"),
+        make_read("f0b", 0, 8, comp, allow=0, molecule_id="f0"),
+    ]
+    for k in range(4):
+        reads.append(make_read(f"p{k}", 0, 4, hap[0:4], allow=0))
+    for k in range(4):
+        reads.append(make_read(f"q{k}", 0, 4, comp[0:4], allow=0))
+    return {"n_sites": 8, "reads": reads}
+
+
+def family_invalid_sample():
+    """Singleton molecule label -> 422 INVALID_INPUT."""
+    payload = family_sample()
+    payload["reads"][0]["molecule_id"] = "lonely"
+    return payload
 
 
 def ambiguous_sample():
@@ -245,8 +310,85 @@ def smoke() -> list[str]:
         check(status == 422, f"status {status}")
         check(body["error"]["code"] == "INVALID_INPUT", f"body {body}")
 
+    def case_unlabelled_compat():
+        """The same reads without molecule_id solve at zero cost and keep
+        the legacy response shape (families present but empty)."""
+        status, body = request("POST", "/api/phase", unlabel_family_sample())
+        check(status == 200, f"status {status}, body {body}")
+        data = body["data"]
+        sol = data["solution"]
+        check(sol["total_mismatch_cost"] == 0, "unlabelled reads should phase at zero cost")
+        check(sol["families"] == [], "families must be empty without molecule_id")
+        for row in sol["per_read"]:
+            check(
+                set(row)
+                == {"id", "group", "mismatch_count", "mismatch_cost", "mismatch_positions"},
+                "per-read legacy shape changed",
+            )
+        check(len(sol["groups"]["haplotype"]) >= 2, "group bound (reads)")
+        check(len(sol["groups"]["complement"]) >= 2, "group bound (reads)")
+
+    def case_family_changes_optimum():
+        """Family labels make members indivisible and change the optimum:
+        cost 0 independently (a4,b4 split) -> positive cost together, with
+        per-family group/members/aggregate evidence returned."""
+        status_free, body_free = request("POST", "/api/phase", unlabel_family_sample())
+        status_fam, body_fam = request("POST", "/api/phase", family_sample())
+        check(status_free == 200 and status_fam == 200, f"statuses {status_free},{status_fam}")
+        free = body_free["data"]
+        fam = body_fam["data"]
+        check(free["solution"]["total_mismatch_cost"] == 0, "independent optimum must be zero")
+        check(fam["solution"]["total_mismatch_cost"] > 0, "family optimum must cost something")
+        check(
+            fam["solution"]["total_mismatch_cost"] != free["solution"]["total_mismatch_cost"],
+            "family constraint must change the optimum",
+        )
+        for sol in fam["solutions"]:
+            groups = {row["id"]: row["group"] for row in sol["per_read"]}
+            check(groups["a4"] == groups["b4"], "cross-group family a4/b4 was split")
+            check(len(sol["groups"]["haplotype"]) >= 2, "group bounds still by read count")
+            check(len(sol["groups"]["complement"]) >= 2, "group bounds still by read count")
+            per_read = {row["id"]: row for row in sol["per_read"]}
+            check(len(sol["families"]) == 5, "five families expected")
+            for block in sol["families"]:
+                check(2 <= len(block["members"]) <= 4, "family size out of range")
+                g = block["group"]
+                check(all(groups[m] == g for m in block["members"]), "family members split")
+                check(
+                    block["mismatch_cost"]
+                    == sum(per_read[m]["mismatch_cost"] for m in block["members"]),
+                    "family mismatch cost does not reconcile",
+                )
+                check(
+                    block["mismatch_count"]
+                    == sum(per_read[m]["mismatch_count"] for m in block["members"]),
+                    "family mismatch count does not reconcile",
+                )
+                check(
+                    block["mismatch_positions"] == sorted(set(block["mismatch_positions"])),
+                    "family mismatch positions not sorted/unique",
+                )
+
+    def case_family_no_solution():
+        status, body = request("POST", "/api/phase", family_no_solution_sample())
+        check(status == 409, f"status {status}")
+        check(
+            body["ok"] is False and body["error"]["code"] == "FAMILY_NO_SOLUTION",
+            f"body {body}",
+        )
+        check("f0" not in body["error"]["message"], "partial assignment leaked in message")
+
+    def case_family_invalid():
+        status, body = request("POST", "/api/phase", family_invalid_sample())
+        check(status == 422, f"status {status}")
+        check(body["error"]["code"] == "INVALID_INPUT", f"body {body}")
+
     run("mismatch sample (unique, exact evidence)", case_mismatch)
     run("ambiguous sample (two tied solutions)", case_ambiguous)
+    run("unlabelled compatibility sample", case_unlabelled_compat)
+    run("family sample (changes the optimum, atomic groups)", case_family_changes_optimum)
+    run("family no-solution business error", case_family_no_solution)
+    run("family invalid-size rejected", case_family_invalid)
     run("no-solution business error", case_no_solution)
     run("discontinuous-coverage business error", case_discontinuous)
     run("invalid input rejected", case_invalid)

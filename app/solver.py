@@ -6,22 +6,32 @@ to ``0``, which removes the group-swap symmetry) each read is assigned to
 exactly one of the two groups (haplotype / complement) so that:
 
 1. the read's number of mismatching positions does not exceed its allowance,
-2. each group holds at least two reads,
+2. each group holds at least two reads (counted by read, not family),
 3. total mismatch cost is minimized, then
 4. the largest per-read mismatch count is minimized, then
 5. the assignment (and, on full ties, the haplotype) is lexicographically
    smallest -- giving a stable decision between uniqueness and ambiguity.
 
+Reads may optionally carry ``molecule_id``.  Reads sharing a molecule id
+form a *family* (2..4 members): fragments of one original molecule must be
+assigned to a single group as a whole, so evidence of one family can never
+be split across the two homologous chromosomes.  Unlabelled reads stay
+independent.  The group-size bounds ("two reads per group") and every
+mismatch limit remain per read.
+
 Algorithm (n_sites <= 18, reads <= 36):
 
 * all 2**(n_sites-1) canonical candidates are tabulated with vectorized
   numpy (per-read mismatch counts and costs against each side);
-* an O(reads) greedy analysis gives the exact minimum achievable cost per
-  candidate (group bounds >= 2 never require flipping more than two reads to
-  their dearer side, and equal-cost neutral reads fill deficits for free);
-* among candidates attaining the global minimum cost, a vectorized dynamic
-  program whose only state is the group-0 count is run with a rising cap K on
-  the per-read mismatch count.  The first K at which the minimum cost is
+* minimum achievable cost per candidate:
+    - without families, the original O(reads) greedy (the two-per-group
+      bounds never cost more than flipping at most two strict reads per
+      side; equal-cost neutral reads fill deficits for free);
+    - with families, an exact vectorized DP over the group-0 *read count*,
+      in which a family is one atomic, weighted (2..4 reads) edge;
+* among candidates attaining the global minimum cost, a vectorized DP whose
+  only state is the group-0 read count is run with a rising cap K on the
+  per-read mismatch count.  The first K at which the minimum cost is
   reachable with 2..n-2 reads in group 0 is optimal; the first two distinct
   candidates feasible there are the reported tie set;
 * a final exact (Python) DP for those at most two candidates yields the
@@ -57,6 +67,7 @@ class Read:
     obs: tuple[int, ...]
     costs: tuple[int, ...]
     max_mismatches: int
+    molecule_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -81,7 +92,7 @@ def _as_int_list(value, what: str) -> list[int]:
     return out
 
 
-def parse_input(payload: object) -> tuple[int, list[Read]]:
+def parse_input(payload: object) -> tuple[int, list[Read], list[tuple[str, tuple[int, ...]]]]:
     if not isinstance(payload, dict):
         raise PhaseError("INVALID_INPUT", "request body must be a JSON object")
 
@@ -99,6 +110,8 @@ def parse_input(payload: object) -> tuple[int, list[Read]]:
 
     reads: list[Read] = []
     seen_ids: set[str] = set()
+    molecule_members: dict[str, list[int]] = {}
+    molecule_order: list[str] = []
     for idx, item in enumerate(raw_reads):
         if not isinstance(item, dict):
             raise PhaseError("INVALID_INPUT", f"reads[{idx}] must be an object")
@@ -108,6 +121,18 @@ def parse_input(payload: object) -> tuple[int, list[Read]]:
         if rid in seen_ids:
             raise PhaseError("INVALID_INPUT", f"duplicate read id: {rid}")
         seen_ids.add(rid)
+
+        molecule = item.get("molecule_id")
+        if molecule is not None:
+            if not isinstance(molecule, str) or not molecule:
+                raise PhaseError(
+                    "INVALID_INPUT",
+                    f"reads[{idx}].molecule_id must be a non-empty string when present",
+                )
+            if molecule not in molecule_members:
+                molecule_members[molecule] = []
+                molecule_order.append(molecule)
+            molecule_members[molecule].append(idx)
 
         start = item.get("start")
         end = item.get("end")
@@ -150,8 +175,23 @@ def parse_input(payload: object) -> tuple[int, list[Read]]:
                 obs=tuple(obs),
                 costs=tuple(costs),
                 max_mismatches=allow,
+                molecule_id=molecule,
             )
         )
+
+    # A molecule family is several (2..4) fragments of one original molecule.
+    # One labelled read carries no family constraint and five or more cannot
+    # be the fragments distinguished here; both are explicit input errors.
+    for mol in molecule_order:
+        size = len(molecule_members[mol])
+        if not 2 <= size <= 4:
+            word = "read" if size == 1 else "reads"
+            raise PhaseError(
+                "INVALID_INPUT",
+                f"molecule_id {mol!r} groups {size} {word}; a molecule family "
+                "must contain between 2 and 4 reads",
+            )
+    families = [(mol, tuple(molecule_members[mol])) for mol in molecule_order]
 
     # The optimizer tabulates costs in signed 64-bit integers; reject inputs
     # whose theoretical maximum total cost could interfere with the DP's
@@ -178,7 +218,7 @@ def parse_input(payload: object) -> tuple[int, list[Read]]:
             f"site {gap} is not covered by any read; reads do not form a continuous tiling",
         )
 
-    return n_sites, reads
+    return n_sites, reads, families
 
 
 # ----- candidate tables -----------------------------------------------------
@@ -230,7 +270,55 @@ def candidate_tables(n_sites: int, reads: list[Read]):
     return mm0, mm1, cost0, cost1, feas0, feas1
 
 
-# ----- minimum-cost greedy analysis ----------------------------------------
+def build_units(
+    families: list[tuple[str, tuple[int, ...]]],
+    n_reads: int,
+    mm0: np.ndarray,
+    mm1: np.ndarray,
+    cost0: np.ndarray,
+    cost1: np.ndarray,
+    feas0: np.ndarray,
+    feas1: np.ndarray,
+):
+    """Aggregate per-read tables into atomic assignment *units*.
+
+    A unit is one whole molecule family (2..4 members) or one independent
+    read.  A unit is feasible on a side only when *every* member is feasible
+    there; its mismatch count on a side is the members' maximum (used for
+    the rising cap) and its cost is the member total.  Family units come
+    first (in first-appearance order), then the singleton reads in input
+    order.  Returns the member lists and arrays shaped ``(C, U)`` plus the
+    per-unit read weights.
+    """
+    c_count = cost0.shape[0]
+    family_index_lists = [list(members) for _mol, members in families]
+    grouped = {i for members in family_index_lists for i in members}
+    single_indices = [[i] for i in range(n_reads) if i not in grouped]
+    member_lists = family_index_lists + single_indices
+
+    u = len(member_lists)
+    uc0 = np.empty((c_count, u), dtype=np.int64)
+    uc1 = np.empty((c_count, u), dtype=np.int64)
+    um0 = np.empty((c_count, u), dtype=np.uint8)
+    um1 = np.empty((c_count, u), dtype=np.uint8)
+    uf0 = np.empty((c_count, u), dtype=bool)
+    uf1 = np.empty((c_count, u), dtype=bool)
+    weights = np.empty(u, dtype=np.int64)
+
+    for ui, members in enumerate(member_lists):
+        cols = np.asarray(members, dtype=np.int64)
+        uc0[:, ui] = cost0[:, cols].sum(axis=1)
+        uc1[:, ui] = cost1[:, cols].sum(axis=1)
+        um0[:, ui] = mm0[:, cols].max(axis=1)
+        um1[:, ui] = mm1[:, cols].max(axis=1)
+        uf0[:, ui] = feas0[:, cols].all(axis=1)
+        uf1[:, ui] = feas1[:, cols].all(axis=1)
+        weights[ui] = len(members)
+
+    return member_lists, uc0, uc1, um0, um1, uf0, uf1, weights
+
+
+# ----- minimum-cost analysis: greedy when every unit is a single read -------
 
 
 def min_cost_for_rows(
@@ -322,7 +410,79 @@ def min_cost_for_rows(
     return out
 
 
-# ----- secondary objective: vectorized capped DP ---------------------------
+# ----- minimum-cost analysis: exact weighted unit DP with families ---------
+
+
+def _unit_weighted_dp(
+    c0: np.ndarray,
+    c1: np.ndarray,
+    a0: np.ndarray,
+    a1: np.ndarray,
+    weights: np.ndarray,
+    n_reads: int,
+    cap_cost: int | None = None,
+) -> np.ndarray:
+    """Minimum cost per group-0 read count, vectorized over candidate rows.
+
+    Each unit contributes its read weight (1..4) to the chosen group's
+    count.  ``a0``/``a1`` gate usable edges (allowance plus, optionally, the
+    rising mismatch cap).  Returns a ``(rows, n_reads+1)`` array; entries
+    that are unreachable or exceed ``cap_cost`` hold the infinity sentinel.
+    """
+    t = c0.shape[0]
+    inf = np.int64(np.iinfo(np.int64).max // 4)
+    work = np.full((t, n_reads + 1), inf, dtype=np.int64)
+    work[:, 0] = 0
+    for i, w in enumerate(int(x) for x in weights):
+        cand0 = np.full((t, n_reads + 1), inf, dtype=np.int64)
+        cand1 = np.full((t, n_reads + 1), inf, dtype=np.int64)
+        rows0 = np.where(a0[:, i])[0]
+        rows1 = np.where(a1[:, i])[0]
+        if rows0.size:
+            # group-0 edge raises the group-0 read count by the unit weight
+            cand0[rows0[:, None], np.arange(w, n_reads + 1)[None, :]] = (
+                work[rows0, : n_reads + 1 - w] + c0[rows0, i : i + 1]
+            )
+        if rows1.size:
+            cand1[rows1, :] = work[rows1, :] + c1[rows1, i : i + 1]
+        work = np.minimum(cand0, cand1)
+        # One step can at most add the aggregate cost (<= 2**58) to inf,
+        # which stays inside int64; clip each step so sums never accumulate
+        # far enough to wrap negative.
+        work[work > inf] = inf
+        if cap_cost is not None:
+            # prune paths already above the target; positive costs mean they
+            # can never return to it
+            work[work > cap_cost] = inf
+    return work
+
+
+def min_cost_units_for_rows(
+    c0: np.ndarray,
+    c1: np.ndarray,
+    f0: np.ndarray,
+    f1: np.ndarray,
+    weights: np.ndarray,
+    n_reads: int,
+    offset: int,
+    chunk: int = 512,
+) -> dict[int, int]:
+    """Exact minimum achievable cost per candidate row with atomic families."""
+    inf = np.int64(np.iinfo(np.int64).max // 4)
+    out: dict[int, int] = {}
+    total_rows = f0.shape[0]
+    for lo in range(0, total_rows, chunk):
+        hi = min(total_rows, lo + chunk)
+        work = _unit_weighted_dp(
+            c0[lo:hi], c1[lo:hi], f0[lo:hi], f1[lo:hi], weights, n_reads
+        )
+        best = work[:, 2 : n_reads - 1].min(axis=1)
+        for k in np.where(best < inf)[0]:
+            out[offset + lo + int(k)] = int(best[k])
+    return out
+
+
+# ----- secondary objective: rising per-read mismatch cap -------------------
 
 
 def feasible_under_cap(
@@ -337,42 +497,66 @@ def feasible_under_cap(
     cap: int,
     chunk: int = 4096,
 ) -> list[int]:
-    """Candidates reaching ``target_cost`` with every read mismatching <= cap.
+    """Read-level: candidates reaching ``target_cost`` with max mismatch <= cap.
 
-    Per candidate the DP keeps, for each possible number of reads assigned to
-    group 0, the minimum total mismatch cost achievable; an edge is only
+    Per candidate the DP keeps, for each possible number of reads assigned
+    to group 0, the minimum total mismatch cost achievable; an edge is only
     usable when its side is feasible (allowance) and its mismatch count does
     not exceed ``cap``.  A candidate succeeds iff some group-0 count in
     ``[2, n-2]`` attains ``target_cost``.
     """
     n = mm0.shape[1]
-    inf = np.int64(np.iinfo(np.int64).max // 4)
     winners: list[int] = []
 
     for start in range(0, len(candidate_ids), chunk):
         ids = candidate_ids[start : start + chunk]
-        t = len(ids)
-        c0v = cost0[ids]
-        c1v = cost1[ids]
         a0 = feas0[ids] & (mm0[ids] <= cap)
         a1 = feas1[ids] & (mm1[ids] <= cap)
-
-        work = np.full((t, n + 1), inf, dtype=np.int64)
-        work[:, 0] = 0
-        for i in range(n):
-            nxt = np.full((t, n + 1), inf, dtype=np.int64)
-            can0 = a0[:, i]
-            can1 = a1[:, i]
-            if np.any(can0):
-                rows0 = np.where(can0)[0]
-                added = work[:, :-1] + c0v[:, i : i + 1]
-                nxt[rows0, 1:] = np.minimum(nxt[rows0, 1:], added[rows0])
-            if np.any(can1):
-                rows1 = np.where(can1)[0]
-                add1 = work + c1v[:, i : i + 1]
-                nxt[rows1, :] = np.minimum(nxt[rows1, :], add1[rows1])
-            work = nxt
+        work = _unit_weighted_dp(
+            cost0[ids],
+            cost1[ids],
+            a0,
+            a1,
+            np.ones(n, dtype=np.int64),
+            n,
+            cap_cost=target_cost,
+        )
         ok = (work[:, 2 : n - 1] == target_cost).any(axis=1)
+        winners.extend(int(candidate_ids[start + k]) for k in np.where(ok)[0])
+    return winners
+
+
+def feasible_units_under_cap(
+    uc0: np.ndarray,
+    uc1: np.ndarray,
+    um0: np.ndarray,
+    um1: np.ndarray,
+    uf0: np.ndarray,
+    uf1: np.ndarray,
+    weights: np.ndarray,
+    n_reads: int,
+    candidate_ids: np.ndarray,
+    target_cost: int,
+    cap: int,
+    chunk: int = 4096,
+) -> list[int]:
+    """Unit-level variant: families move atomically; counts are read weights."""
+    winners: list[int] = []
+
+    for start in range(0, len(candidate_ids), chunk):
+        ids = candidate_ids[start : start + chunk]
+        a0 = uf0[ids] & (um0[ids] <= cap)
+        a1 = uf1[ids] & (um1[ids] <= cap)
+        work = _unit_weighted_dp(
+            uc0[ids],
+            uc1[ids],
+            a0,
+            a1,
+            weights,
+            n_reads,
+            cap_cost=target_cost,
+        )
+        ok = (work[:, 2 : n_reads - 1] == target_cost).any(axis=1)
         winners.extend(int(candidate_ids[start + k]) for k in np.where(ok)[0])
     return winners
 
@@ -387,6 +571,9 @@ def solve_assignments(
     c1: list[int],
     f0: list[bool],
     f1: list[bool],
+    weights: list[int],
+    masks: list[int],
+    n_reads: int,
     target_cost: int,
     cap: int,
     limit: int = 2,
@@ -395,18 +582,21 @@ def solve_assignments(
 
     Every returned pair ``(actual max mismatches, assignment bits)`` reaches
     ``target_cost`` with every read mismatching at most ``cap`` and both
-    groups populated.  When ``cap`` is the optimal secondary-objective value,
-    each returned assignment has max mismatches exactly ``cap`` (an
-    assignment with a smaller maximum would have been feasible at the
-    previous cap).  Reads occupy bits from the most significant end, so
-    integer order is the lexicographic order of group labels.
+    groups holding at least two reads.  Families move atomically: a unit-1
+    edge sets all of the family's member bits.  When ``cap`` is the optimal
+    secondary-objective value, each returned assignment has max mismatches
+    exactly ``cap`` (an assignment with a smaller maximum would have been
+    feasible at the previous cap).  Reads occupy bits from the most
+    significant end, so integer order is the lexicographic order of group
+    labels.
     """
     n = len(m0)
-    # state: (group0 count, max-mm group0, max-mm group1) -> (cost, bits)
+    # state: (group0 read count, max-mm group0, max-mm group1) -> (cost, bits)
     dp: dict[tuple[int, int, int], tuple[int, int]] = {(0, 0, 0): (0, 0)}
 
     for i in range(n):
-        bit = 1 << (n - 1 - i)
+        w = weights[i]
+        mask = masks[i]
         can0 = f0[i] and m0[i] <= cap
         can1 = f1[i] and m1[i] <= cap
         nxt: dict[tuple[int, int, int], tuple[int, int]] = {}
@@ -414,7 +604,7 @@ def solve_assignments(
             if can0:
                 t = tot + c0[i]
                 if t <= target_cost:
-                    key = (cnt + 1, max(mx0, m0[i]), mx1)
+                    key = (cnt + w, max(mx0, m0[i]), mx1)
                     val = (t, assign)
                     old = nxt.get(key)
                     if old is None or val < old:
@@ -423,7 +613,7 @@ def solve_assignments(
                 t = tot + c1[i]
                 if t <= target_cost:
                     key = (cnt, mx0, max(mx1, m1[i]))
-                    val = (t, assign | bit)
+                    val = (t, assign | mask)
                     old = nxt.get(key)
                     if old is None or val < old:
                         nxt[key] = val
@@ -431,7 +621,7 @@ def solve_assignments(
 
     finals: list[tuple[int, int]] = []  # (bits, max mm)
     for (cnt, mx0, mx1), (tot, assign) in dp.items():
-        if tot == target_cost and 2 <= cnt <= n - 2:
+        if tot == target_cost and 2 <= cnt <= n_reads - 2:
             finals.append((assign, max(mx0, mx1)))
     finals.sort()
     return [(mx, bits) for bits, mx in finals[:limit]]
@@ -448,32 +638,86 @@ def _bits_to_tuple(bits: int, n: int) -> tuple[int, ...]:
     return tuple((bits >> (n - 1 - i)) & 1 for i in range(n))
 
 
-def enumerate_solutions(n_sites: int, reads: list[Read]) -> list[Solution]:
+def enumerate_solutions(
+    n_sites: int,
+    reads: list[Read],
+    families: list[tuple[str, tuple[int, ...]]],
+) -> tuple[list[Solution], bool]:
+    """Optimal solutions plus a family-level feasibility flag.
+
+    The flag is False iff at least one family exists yet no canonical
+    haplotype lets every family be placed wholly on one side within its
+    members' mismatch allowances -- a distinguishable failure from the
+    ordinary count / allowance dead end, and it is decided before any
+    assignment is produced.
+    """
     n = len(reads)
     mm0, mm1, cost0, cost1, feas0, feas1 = candidate_tables(n_sites, reads)
     c_count = 1 << (n_sites - 1)
+    have_families = bool(families)
 
-    # Pass 1: exact minimum cost per candidate, in lexicographic chunk order.
-    min_costs: dict[int, int] = {}
-    global_best: int | None = None
-    for base in range(0, c_count, 4096):
-        stop = min(c_count, base + 4096)
-        part = min_cost_for_rows(
-            mm0[base:stop],
-            mm1[base:stop],
-            cost0[base:stop],
-            cost1[base:stop],
-            feas0[base:stop],
-            feas1[base:stop],
-            base,
+    if have_families:
+        (
+            member_lists,
+            uc0,
+            uc1,
+            um0,
+            um1,
+            uf0,
+            uf1,
+            weights,
+        ) = build_units(families, n, mm0, mm1, cost0, cost1, feas0, feas1)
+
+        fam_cols = np.arange(len(families))
+        family_feasible_anywhere = bool(
+            ((uf0[:, fam_cols] | uf1[:, fam_cols])).all(axis=1).any()
         )
-        if part:
-            min_costs.update(part)
-            chunk_best = min(part.values())
-            if global_best is None or chunk_best < global_best:
-                global_best = chunk_best
+
+        min_costs: dict[int, int] = {}
+        global_best: int | None = None
+        for base in range(0, c_count, 4096):
+            stop = min(c_count, base + 4096)
+            part = min_cost_units_for_rows(
+                uc0[base:stop],
+                uc1[base:stop],
+                uf0[base:stop],
+                uf1[base:stop],
+                weights,
+                n,
+                base,
+            )
+            if part:
+                min_costs.update(part)
+                chunk_best = min(part.values())
+                if global_best is None or chunk_best < global_best:
+                    global_best = chunk_best
+    else:
+        member_lists = [[i] for i in range(n)]
+        weights = np.ones(n, dtype=np.int64)
+        uc0 = uc1 = um0 = um1 = uf0 = uf1 = None  # type: ignore[assignment]
+        family_feasible_anywhere = True
+
+        min_costs = {}
+        global_best = None
+        for base in range(0, c_count, 4096):
+            stop = min(c_count, base + 4096)
+            part = min_cost_for_rows(
+                mm0[base:stop],
+                mm1[base:stop],
+                cost0[base:stop],
+                cost1[base:stop],
+                feas0[base:stop],
+                feas1[base:stop],
+                base,
+            )
+            if part:
+                min_costs.update(part)
+                chunk_best = min(part.values())
+                if global_best is None or chunk_best < global_best:
+                    global_best = chunk_best
+
     if global_best is None:
-        return []
+        return [], family_feasible_anywhere
 
     tied = np.asarray(
         sorted(hb for hb, mc in min_costs.items() if mc == global_best), dtype=np.int64
@@ -487,15 +731,43 @@ def enumerate_solutions(n_sites: int, reads: list[Read]) -> list[Solution]:
     chosen: list[int] = []
     chosen_cap = 0
     for cap in range(0, max_span + 1):
-        found = feasible_under_cap(
-            mm0, mm1, cost0, cost1, feas0, feas1, tied, global_best, cap=cap
-        )
+        if have_families:
+            found = feasible_units_under_cap(
+                uc0,
+                uc1,
+                um0,
+                um1,
+                uf0,
+                uf1,
+                weights,
+                n,
+                tied,
+                global_best,
+                cap=cap,
+            )
+        else:
+            found = feasible_under_cap(
+                mm0,
+                mm1,
+                cost0,
+                cost1,
+                feas0,
+                feas1,
+                tied,
+                global_best,
+                cap=cap,
+            )
         if found:
             chosen = sorted(found)[:2]
             chosen_cap = cap
             break
-    if not chosen:  # pragma: no cover - min_cost already guarantees feasibility
-        return []
+    if not chosen:  # pragma: no cover - pass 1 already guarantees feasibility
+        return [], family_feasible_anywhere
+
+    unit_weights = [int(weights[i]) for i in range(len(member_lists))]
+    unit_masks = [
+        sum(1 << (n - 1 - read_idx) for read_idx in members) for members in member_lists
+    ]
 
     # Gather the first two distinct *solutions*.  Two assignments under the
     # same haplotype are distinct solutions (the swap-equivalent copy is the
@@ -505,17 +777,36 @@ def enumerate_solutions(n_sites: int, reads: list[Read]) -> list[Solution]:
     for hb in chosen:
         if len(picked) >= 2:
             break
-        exact_list = solve_assignments(
-            mm0[hb].tolist(),
-            mm1[hb].tolist(),
-            cost0[hb].tolist(),
-            cost1[hb].tolist(),
-            feas0[hb].tolist(),
-            feas1[hb].tolist(),
-            global_best,
-            chosen_cap,
-            limit=2 - len(picked),
-        )
+        if have_families:
+            exact_list = solve_assignments(
+                um0[hb].tolist(),
+                um1[hb].tolist(),
+                uc0[hb].tolist(),
+                uc1[hb].tolist(),
+                uf0[hb].tolist(),
+                uf1[hb].tolist(),
+                unit_weights,
+                unit_masks,
+                n,
+                global_best,
+                chosen_cap,
+                limit=2 - len(picked),
+            )
+        else:
+            exact_list = solve_assignments(
+                mm0[hb].tolist(),
+                mm1[hb].tolist(),
+                cost0[hb].tolist(),
+                cost1[hb].tolist(),
+                feas0[hb].tolist(),
+                feas1[hb].tolist(),
+                unit_weights,
+                unit_masks,
+                n,
+                global_best,
+                chosen_cap,
+                limit=2 - len(picked),
+            )
         for maxmm, assign_bits in exact_list:
             picked.append((hb, maxmm, assign_bits))
 
@@ -550,14 +841,23 @@ def enumerate_solutions(n_sites: int, reads: list[Read]) -> list[Solution]:
                 mismatch_positions=tuple(mm_pos),
             )
         )
-    return solutions
+    return solutions, family_feasible_anywhere
 
 
 def phase(payload: object) -> dict:
     """Validate, solve and build the API response payload."""
-    n_sites, reads = parse_input(payload)
-    solutions = enumerate_solutions(n_sites, reads)
+    n_sites, reads, families = parse_input(payload)
+    solutions, family_feasible_anywhere = enumerate_solutions(n_sites, reads, families)
     if not solutions:
+        if not family_feasible_anywhere:
+            # No partial assignment is produced on this path; the message
+            # names only the family constraint, never a half-built grouping.
+            raise PhaseError(
+                "FAMILY_NO_SOLUTION",
+                "no canonical haplotype lets every molecule family be assigned "
+                "to one group as a whole while each member stays within its "
+                "mismatch allowance",
+            )
         raise PhaseError(
             "NO_SOLUTION",
             "no complementary haplotype pair admits an assignment with at "
@@ -584,12 +884,31 @@ def phase(payload: object) -> dict:
                     "mismatch_positions": list(pos),
                 }
             )
+
+        family_blocks: list[dict] = []
+        for mol, members in families:
+            g = sol.assignments[members[0]]
+            total_count = sum(sol.mismatch_counts[i] for i in members)
+            total_cost = sum(sol.mismatch_costs[i] for i in members)
+            positions = sorted({p for i in members for p in sol.mismatch_positions[i]})
+            family_blocks.append(
+                {
+                    "molecule_id": mol,
+                    "group": g,
+                    "members": [reads[i].id for i in members],
+                    "mismatch_count": total_count,
+                    "mismatch_cost": total_cost,
+                    "mismatch_positions": positions,
+                }
+            )
+
         return {
             "haplotype": list(sol.haplotype),
             "complement": [1 - b for b in sol.haplotype],
             "groups": {"haplotype": groups[0], "complement": groups[1]},
             "assignments": list(sol.assignments),
             "per_read": per_read,
+            "families": family_blocks,
             "total_mismatch_cost": sol.total_cost,
             "max_per_read_mismatches": sol.max_mismatches,
             "mismatch_positions": sorted({p for tup in sol.mismatch_positions for p in tup}),
@@ -604,7 +923,8 @@ def phase(payload: object) -> dict:
     if len(solutions) > 1:
         response["note"] = (
             "two distinct solutions tie on (total_mismatch_cost, "
-            "max_per_read_mismatches); they may differ in haplotype or in the "
-            "per-read assignment. The first two canonical solutions are returned"
+            "max_per_read_mismatches); they may differ in haplotype, in the "
+            "per-read assignment, or in a molecule family's group. The first "
+            "two canonical solutions are returned"
         )
     return response
