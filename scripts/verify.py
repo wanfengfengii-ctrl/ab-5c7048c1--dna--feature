@@ -10,7 +10,11 @@ Runs inside the image (or a local checkout) and performs, in order:
        mismatch evidence,
      * an ambiguous instance returning the first two distinct solutions,
      * NO_SOLUTION and DISCONTINUOUS_INPUT business errors,
-     * INVALID_INPUT shape validation.
+     * INVALID_INPUT shape validation,
+     * unlabelled backward compatibility (no ``families`` key, same optimum),
+     * a molecule-family instance whose co-assignment constraint changes the
+       optimum, with the per-family assignment/cost/positions payload,
+     * NO_FAMILY_SOLUTION and invalid family-shape rejections.
 
 The exit code is a bit-mask summarizing the stages:
 
@@ -113,6 +117,30 @@ def discontinuous_sample():
         "n_sites": 8,
         "reads": [make_read(f"d{j}", s, e, [0] * (e - s), allow=e - s) for j, (s, e) in enumerate(spans)],
     }
+
+
+def family_sample(max_b0_mismatches=2):
+    """Clean instance plus family {a0, b0} labelled ``molA``.
+
+    Unlabelled, b0 sits cleanly on the complement side (optimum 0).  Forced
+    to share a group with a0, the family must take the haplotype side where
+    b0 mismatches at both of its positions -- the co-assignment constraint
+    raises the optimum to 2.  With ``max_b0_mismatches=1`` the family fits
+    nowhere and the service must answer NO_FAMILY_SOLUTION.
+    """
+    hap = [0, 1, 1, 0, 1, 0, 0, 1]
+    comp = [1 - b for b in hap]
+    spans0 = [(0, 3), (2, 5), (4, 7), (1, 4), (5, 8)]
+    spans1 = [(0, 2), (3, 6), (6, 8), (2, 4), (4, 8)]
+    reads = []
+    for i, (s, e) in enumerate(spans0):
+        reads.append(make_read(f"a{i}", s, e, hap[s:e], allow=0))
+    for i, (s, e) in enumerate(spans1):
+        reads.append(make_read(f"b{i}", s, e, comp[s:e], allow=0))
+    reads[0]["molecule_id"] = "molA"
+    reads[5]["molecule_id"] = "molA"
+    reads[5]["max_mismatches"] = max_b0_mismatches
+    return {"n_sites": 8, "reads": reads}
 
 
 # --------------------------------------------------------------------------
@@ -245,11 +273,65 @@ def smoke() -> list[str]:
         check(status == 422, f"status {status}")
         check(body["error"]["code"] == "INVALID_INPUT", f"body {body}")
 
+    def case_unlabelled_compat():
+        """Unlabelled requests keep the legacy shape: no families key."""
+        payload = family_sample()
+        for r in payload["reads"]:
+            r.pop("molecule_id", None)
+        status, body = request("POST", "/api/phase", payload)
+        check(status == 200, f"status {status}, body {body}")
+        data = body["data"]
+        check(data["unique"] is True, "unlabelled instance should be unique")
+        check(data["solution"]["total_mismatch_cost"] == 0, "unlabelled optimum must stay 0")
+        check("families" not in data["solution"], "unlabelled response must not carry families")
+
+    def case_family_changes_optimum():
+        payload = family_sample()
+        status, body = request("POST", "/api/phase", payload)
+        check(status == 200, f"status {status}, body {body}")
+        data = body["data"]
+        check(data["unique"] is True, "family instance should be unique")
+        sol = data["solution"]
+        check(sol["total_mismatch_cost"] == 2, f"family optimum {sol['total_mismatch_cost']} != 2")
+        check(sol["max_per_read_mismatches"] == 2, "family max per-read mismatches != 2")
+        fams = sol.get("families")
+        check(isinstance(fams, list) and len(fams) == 1, f"families payload {fams}")
+        fam = fams[0]
+        check(fam["molecule_id"] == "molA", "family id")
+        check(fam["group"] == 0, "family must be co-assigned to the haplotype side")
+        check(fam["members"] == ["a0", "b0"], f"family members {fam['members']}")
+        check(fam["mismatch_cost"] == 2, "family mismatch cost")
+        check(fam["mismatch_count"] == 2, "family mismatch count")
+        check(fam["mismatch_positions"] == [0, 1], "family mismatch positions")
+        by_id = {r["id"]: r for r in sol["per_read"]}
+        check(by_id["a0"]["group"] == by_id["b0"]["group"] == 0, "members must share a group")
+        check(
+            fam["mismatch_cost"] == by_id["a0"]["mismatch_cost"] + by_id["b0"]["mismatch_cost"],
+            "family cost must equal the sum of member costs",
+        )
+
+    def case_family_no_solution():
+        status, body = request("POST", "/api/phase", family_sample(max_b0_mismatches=1))
+        check(status == 409, f"status {status}")
+        check(body["ok"] is False and body["error"]["code"] == "NO_FAMILY_SOLUTION", f"body {body}")
+        check("data" not in body, "no partial assignment may leak")
+
+    def case_family_invalid():
+        payload = family_sample()
+        del payload["reads"][5]["molecule_id"]  # molA shrinks to a single read
+        status, body = request("POST", "/api/phase", payload)
+        check(status == 422, f"status {status}")
+        check(body["error"]["code"] == "INVALID_INPUT", f"body {body}")
+
     run("mismatch sample (unique, exact evidence)", case_mismatch)
     run("ambiguous sample (two tied solutions)", case_ambiguous)
     run("no-solution business error", case_no_solution)
     run("discontinuous-coverage business error", case_discontinuous)
     run("invalid input rejected", case_invalid)
+    run("unlabelled backward compatibility", case_unlabelled_compat)
+    run("family constraint changes optimum", case_family_changes_optimum)
+    run("family-blocked business error", case_family_no_solution)
+    run("invalid family shape rejected", case_family_invalid)
     return failures
 
 

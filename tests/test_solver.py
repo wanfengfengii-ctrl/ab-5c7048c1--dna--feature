@@ -75,21 +75,61 @@ def random_instance(n_sites, m, seed):
     raise AssertionError("could not generate a covering instance")
 
 
+def _mm_count(read, hap, g):
+    mm = 0
+    for k, site in enumerate(range(read.start, read.end)):
+        mismatch = (read.obs[k] != hap[site]) if g == 0 else (read.obs[k] == hap[site])
+        if mismatch:
+            mm += 1
+    return mm
+
+
 def brute_force(n_sites, reads):
     """Enumerate every (canonical haplotype, assignment) pair.
 
-    Returns the sorted list of optimum distinct solutions as
-    ``(total, maxmm, hap_tuple, assignment_tuple)``.
+    Returns ``(winners, family_blocked)``: ``winners`` is the sorted list of
+    optimum distinct solutions as ``(total, maxmm, hap_tuple,
+    assignment_tuple)``; ``family_blocked`` is True when families exist and
+    no canonical haplotype lets every family sit wholly on one side within
+    its members' allowances (the NO_FAMILY_SOLUTION condition).
     """
-    parsed = parse_input({"n_sites": n_sites, "reads": reads})
-    n_sites, pr = parsed
+    n_sites, pr, families = parse_input({"n_sites": n_sites, "reads": reads})
     n = len(pr)
+    # co-assignment units: families plus independent singleton reads
+    units = [list(f.members) for f in families]
+    grouped = {i for f in families for i in f.members}
+    units += [[i] for i in range(n) if i not in grouped]
+    units.sort(key=min)
+
+    def hap_tuple(hap_bits):
+        return (0,) + tuple((hap_bits >> (n_sites - 2 - s)) & 1 for s in range(n_sites - 1))
+
+    family_blocked = False
+    if families:
+        family_blocked = True
+        for hap_bits in range(1 << (n_sites - 1)):
+            hap = hap_tuple(hap_bits)
+            if all(
+                any(
+                    all(_mm_count(pr[i], hap, g) <= pr[i].max_mismatches for i in fam.members)
+                    for g in (0, 1)
+                )
+                for fam in families
+            ):
+                family_blocked = False
+                break
+
     best = None
     winners = []
     for hap_bits in range(1 << (n_sites - 1)):
-        hap = (0,) + tuple((hap_bits >> (n_sites - 2 - s)) & 1 for s in range(n_sites - 1))
-        for ab in range(1 << n):
-            assign = tuple((ab >> (n - 1 - i)) & 1 for i in range(n))
+        hap = hap_tuple(hap_bits)
+        for ub in range(1 << len(units)):
+            assign = [0] * n
+            for ui, members in enumerate(units):
+                g = (ub >> ui) & 1
+                for mi in members:
+                    assign[mi] = g
+            assign = tuple(assign)
             if assign.count(0) < 2 or assign.count(1) < 2:
                 continue
             total = 0
@@ -117,7 +157,7 @@ def brute_force(n_sites, reads):
                 winners.append(rec)
     # Canonical solution order: haplotype first, then assignment.
     winners.sort(key=lambda r: (r[2], r[3]))
-    return winners
+    return winners, family_blocked
 
 
 # --------------------------------------------------------------------------
@@ -345,9 +385,10 @@ def test_invalid_counts_and_shapes():
 @pytest.mark.parametrize("seed", range(40))
 def test_matches_brute_force_random(seed):
     n_sites, reads = random_instance(8, 10, seed)
-    expected = brute_force(n_sites, reads)
-    n_sites_p, parsed = parse_input({"n_sites": n_sites, "reads": reads})
-    got = enumerate_solutions(n_sites_p, parsed)
+    expected, _ = brute_force(n_sites, reads)
+    n_sites_p, parsed, families = parse_input({"n_sites": n_sites, "reads": reads})
+    assert families == []
+    got = enumerate_solutions(n_sites_p, parsed, families)
 
     if not expected:
         assert got == []
@@ -368,3 +409,207 @@ def test_matches_brute_force_random(seed):
         assert len(out["solutions"]) == 2
     else:
         assert len(out["solutions"]) == 1
+
+
+# --------------------------------------------------------------------------
+# molecule families
+# --------------------------------------------------------------------------
+
+
+def family_instance():
+    """clean_instance plus family {a0, b0}; b0 may absorb 2 mismatches.
+
+    Unlabelled, b0 sits cleanly on the complement side (cost 0).  Forced to
+    share a group with a0, the family must take the haplotype side where b0
+    mismatches at both of its positions (cost 2) -- the family constraint
+    strictly worsens the optimum.
+    """
+    n_sites, reads, hap = clean_instance()
+    reads[0]["molecule_id"] = "molA"  # a0, group-0 read
+    reads[5]["molecule_id"] = "molA"  # b0, group-1 read
+    reads[5]["max_mismatches"] = 2
+    return n_sites, reads, hap
+
+
+def test_family_constraint_changes_optimum():
+    n_sites, reads, hap = family_instance()
+
+    # unlabelled baseline: the two reads land on opposite sides, cost 0
+    plain = phase({"n_sites": n_sites, "reads": [dict(r, molecule_id=None) for r in reads]})
+    assert plain["solution"]["total_mismatch_cost"] == 0
+    assert "families" not in plain["solution"]
+
+    out = phase({"n_sites": n_sites, "reads": reads})
+    assert out["unique"] is True
+    sol = out["solution"]
+    assert sol["total_mismatch_cost"] == 2
+    assert sol["max_per_read_mismatches"] == 2
+    assert sol["haplotype"] == hap
+
+    by_id = {row["id"]: row for row in sol["per_read"]}
+    # co-assignment: both members on the haplotype side
+    assert by_id["a0"]["group"] == 0
+    assert by_id["b0"]["group"] == 0
+    assert by_id["b0"]["mismatch_count"] == 2
+    assert by_id["b0"]["mismatch_cost"] == 2
+    assert by_id["b0"]["mismatch_positions"] == [0, 1]
+
+    (fam,) = sol["families"]
+    assert fam == {
+        "molecule_id": "molA",
+        "group": 0,
+        "members": ["a0", "b0"],
+        "mismatch_count": 2,
+        "mismatch_cost": 2,
+        "mismatch_positions": [0, 1],
+    }
+    # family totals reconcile with the per-read evidence
+    assert sum(r["mismatch_cost"] for r in sol["per_read"]) == sol["total_mismatch_cost"]
+
+
+def test_family_of_two_can_form_a_group_alone():
+    """The >=2-per-group bound counts reads, not families."""
+    n_sites = 8
+    hap = [0, 1, 1, 0, 1, 0, 0, 1]
+    comp = [1 - b for b in hap]
+    reads = [
+        make_read("x0", 0, 3, hap[0:3], allow=0),
+        make_read("x1", 2, 5, hap[2:5], allow=0),
+    ]
+    reads[0]["molecule_id"] = "molZ"
+    reads[1]["molecule_id"] = "molZ"
+    for j, (s, e) in enumerate([(0, 2), (2, 4), (4, 6), (6, 8), (1, 3), (3, 5), (5, 7), (0, 4)]):
+        reads.append(make_read(f"y{j}", s, e, comp[s:e], allow=0))
+
+    out = phase({"n_sites": n_sites, "reads": reads})
+    assert out["unique"] is True
+    sol = out["solution"]
+    assert sol["total_mismatch_cost"] == 0
+    # group 0 holds exactly the two-member family -- valid because the bound
+    # counts reads (2 >= 2), not families
+    assert sol["groups"]["haplotype"] == ["x0", "x1"]
+    assert len(sol["groups"]["complement"]) == 8
+    (fam,) = sol["families"]
+    assert fam["group"] == 0 and fam["members"] == ["x0", "x1"]
+
+
+def test_family_of_four_coassigned():
+    n_sites, reads, hap = clean_instance()
+    for i in range(4):  # a0..a3 are all clean group-0 reads
+        reads[i]["molecule_id"] = "molQ"
+    out = phase({"n_sites": n_sites, "reads": reads})
+    assert out["unique"] is True
+    sol = out["solution"]
+    assert sol["total_mismatch_cost"] == 0
+    (fam,) = sol["families"]
+    assert fam["members"] == ["a0", "a1", "a2", "a3"]
+    assert fam["group"] == 0
+    assert fam["mismatch_cost"] == 0
+    assert fam["mismatch_positions"] == []
+
+
+def test_no_family_solution_when_family_never_fits():
+    n_sites, reads, _ = family_instance()
+    reads[5]["max_mismatches"] = 1  # b0 can absorb only 1 of its 2 mismatches
+    with pytest.raises(PhaseError) as exc:
+        phase({"n_sites": n_sites, "reads": reads})
+    assert exc.value.code == "NO_FAMILY_SOLUTION"
+
+
+def test_family_invalid_input():
+    n_sites, reads, _ = clean_instance()
+
+    def expect_invalid(mutated):
+        with pytest.raises(PhaseError) as exc:
+            phase({"n_sites": n_sites, "reads": mutated})
+        assert exc.value.code == "INVALID_INPUT"
+
+    # family of one
+    solo = [dict(r) for r in reads]
+    solo[0]["molecule_id"] = "mol1"
+    expect_invalid(solo)
+    # family of five
+    big = [dict(r) for r in reads]
+    for r in big[:5]:
+        r["molecule_id"] = "mol5"
+    expect_invalid(big)
+    # empty identifier
+    empty = [dict(r) for r in reads]
+    empty[0]["molecule_id"] = ""
+    empty[1]["molecule_id"] = ""
+    expect_invalid(empty)
+    # non-string identifier
+    weird = [dict(r) for r in reads]
+    weird[0]["molecule_id"] = 7
+    weird[1]["molecule_id"] = 7
+    expect_invalid(weird)
+    # explicit null means "no family" and stays legal
+    nullable = [dict(r) for r in reads]
+    nullable[3]["molecule_id"] = None
+    out = phase({"n_sites": n_sites, "reads": nullable})
+    assert out["unique"] is True
+    assert "families" not in out["solution"]
+
+
+def random_family_instance(n_sites, m, seed):
+    """random_instance plus 1-3 random molecule families of size 2-4."""
+    n_sites, reads = random_instance(n_sites, m, seed)
+    rng = random.Random(seed * 7919 + 13)
+    order = list(range(len(reads)))
+    rng.shuffle(order)
+    pos = 0
+    for f in range(rng.randint(1, 3)):
+        size = rng.randint(2, 4)
+        if pos + size > len(order):
+            break
+        for i in order[pos : pos + size]:
+            reads[i]["molecule_id"] = f"mol{f}"
+        pos += size
+    return n_sites, reads
+
+
+@pytest.mark.parametrize("seed", range(30))
+def test_matches_brute_force_with_families(seed):
+    n_sites, reads = random_family_instance(8, 10, seed)
+    expected, family_blocked = brute_force(n_sites, reads)
+    n_sites_p, parsed, families = parse_input({"n_sites": n_sites, "reads": reads})
+    assert families  # the generator must actually label some reads
+
+    if not expected:
+        if family_blocked:
+            with pytest.raises(PhaseError) as exc:
+                enumerate_solutions(n_sites_p, parsed, families)
+            assert exc.value.code == "NO_FAMILY_SOLUTION"
+        else:
+            assert enumerate_solutions(n_sites_p, parsed, families) == []
+        return
+
+    got = enumerate_solutions(n_sites_p, parsed, families)
+    assert len(got) <= 2
+    for k, sol in enumerate(got):
+        exp = expected[k]
+        assert sol.haplotype == exp[2]
+        assert sol.assignments == exp[3]
+        assert sol.total_cost == exp[0]
+        assert sol.max_mismatches == exp[1]
+
+    out = phase({"n_sites": n_sites, "reads": reads})
+    assert out["unique"] is (len(expected) == 1)
+    for sol_dict in out["solutions"]:
+        # co-assignment: family members always share one group
+        for fam in families:
+            assert len({sol_dict["assignments"][i] for i in fam.members}) == 1
+        # the families payload reconciles with the per-read evidence
+        per_read = {row["id"]: row for row in sol_dict["per_read"]}
+        fam_out = {f["molecule_id"]: f for f in sol_dict["families"]}
+        assert set(fam_out) == {f.molecule_id for f in families}
+        for fam in families:
+            entry = fam_out[fam.molecule_id]
+            member_ids = [parsed[i].id for i in fam.members]
+            assert entry["members"] == member_ids
+            assert entry["group"] == sol_dict["assignments"][fam.members[0]]
+            assert entry["mismatch_cost"] == sum(per_read[r]["mismatch_cost"] for r in member_ids)
+            assert entry["mismatch_count"] == sum(per_read[r]["mismatch_count"] for r in member_ids)
+            assert entry["mismatch_positions"] == sorted(
+                {p for r in member_ids for p in per_read[r]["mismatch_positions"]}
+            )

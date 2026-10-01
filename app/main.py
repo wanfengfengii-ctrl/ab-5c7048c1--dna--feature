@@ -14,9 +14,10 @@ app = FastAPI(
     title="Ancient-DNA phasing API",
     description=(
         "Jointly recovers a pair of complementary binary haplotypes and a "
-        "unique group assignment per molecular read."
+        "unique group assignment per molecular read. Reads sharing a "
+        "molecule_id are kept on the same chromosome as one family."
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 _STARTED_AT = time.time()

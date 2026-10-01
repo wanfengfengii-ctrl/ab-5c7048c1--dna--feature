@@ -138,3 +138,87 @@ def test_ambiguous_payload_reports_two_solutions():
     assert body["data"]["unique"] is False
     assert len(body["data"]["solutions"]) == 2
     assert body["data"]["note"]
+
+
+# --------------------------------------------------------------------------
+# molecule families
+# --------------------------------------------------------------------------
+
+
+def family_payload():
+    """clean_payload with family {a0, b0}; b0 tolerates 2 mismatches."""
+    payload = clean_payload()
+    by_id = {r["id"]: r for r in payload["reads"]}
+    by_id["a0"]["molecule_id"] = "molA"
+    by_id["b0"]["molecule_id"] = "molA"
+    by_id["b0"]["max_mismatches"] = 2
+    return payload
+
+
+def test_unlabelled_response_has_no_families_key():
+    r = client.post("/api/phase", json=clean_payload())
+    assert r.status_code == 200
+    assert "families" not in r.json()["data"]["solution"]
+
+
+def test_family_changes_optimum_and_is_reported():
+    payload = family_payload()
+    r = client.post("/api/phase", json=payload)
+    assert r.status_code == 200
+    data = r.json()["data"]
+    assert data["unique"] is True
+    sol = data["solution"]
+    # without the family constraint the optimum would be 0 (b0 on side 1)
+    assert sol["total_mismatch_cost"] == 2
+    assert sol["max_per_read_mismatches"] == 2
+    (fam,) = sol["families"]
+    assert fam["molecule_id"] == "molA"
+    assert fam["group"] == 0
+    assert fam["members"] == ["a0", "b0"]
+    assert fam["mismatch_cost"] == 2
+    assert fam["mismatch_count"] == 2
+    assert fam["mismatch_positions"] == [0, 1]
+    by_id = {row["id"]: row for row in sol["per_read"]}
+    assert by_id["a0"]["group"] == by_id["b0"]["group"] == 0
+
+
+def test_family_no_family_solution_409():
+    payload = family_payload()
+    for r_ in payload["reads"]:
+        if r_["id"] == "b0":
+            r_["max_mismatches"] = 1
+    r = client.post("/api/phase", json=payload)
+    assert r.status_code == 409
+    body = r.json()
+    assert body["ok"] is False
+    assert body["error"]["code"] == "NO_FAMILY_SOLUTION"
+    assert "data" not in body  # no half-solved assignment leaks
+
+
+def test_family_invalid_input_422():
+    base = clean_payload()
+
+    def post(mutate):
+        payload = clean_payload()
+        mutate(payload["reads"])
+        return client.post("/api/phase", json=payload)
+
+    # family of one
+    r = post(lambda reads: reads[0].update(molecule_id="mol1"))
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "INVALID_INPUT"
+    # family of five
+    r = post(lambda reads: [x.update(molecule_id="mol5") for x in reads[:5]])
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "INVALID_INPUT"
+    # empty identifier
+    r = post(lambda reads: (reads[0].update(molecule_id=""), reads[1].update(molecule_id="")))
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "INVALID_INPUT"
+    # non-string identifier
+    r = post(lambda reads: (reads[0].update(molecule_id=3), reads[1].update(molecule_id=3)))
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "INVALID_INPUT"
+    # sanity: the untouched payload still solves
+    r = client.post("/api/phase", json=base)
+    assert r.status_code == 200
